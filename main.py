@@ -2,15 +2,20 @@ import os
 import asyncio
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 import google.generativeai as genai
-import requests
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 import pickle
+import pytchat
+from twitchAPI.twitch import Twitch
+from twitchAPI.oauth import UserAuthenticator
+from twitchAPI.type import AuthScope, ChatEvent
+from twitchAPI.chat import Chat, EventData, ChatMessage
 
 load_dotenv()
 
@@ -21,8 +26,18 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
 TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
 TWITCH_CHANNEL_NAME = os.getenv("TWITCH_CHANNEL_NAME")  # e.g., "your_channel"
+YOUTUBE_VIDEO_ID = os.getenv("YOUTUBE_VIDEO_ID")  # The live stream video ID
 
 app = FastAPI()
+
+# CORS Middleware to prevent 405 errors from Flutter
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with your Flutter app's domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -32,57 +47,25 @@ model = genai.GenerativeModel('gemini-2.5-flash-lite')
 # YouTube OAuth Scopes
 YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
 
+# Global references for chat clients
+twitch_chat = None
+youtube_chat_listener = None
+
 class BroadcastRequest(BaseModel):
     message: str
     username: str
 
 
-# ========== TWITCH INTEGRATION ==========
-
-def get_twitch_token():
-    """Get OAuth token for Twitch API"""
-    url = "https://id.twitch.tv/oauth2/token"
-    params = {
-        "client_id": TWITCH_CLIENT_ID,
-        "client_secret": TWITCH_CLIENT_SECRET,
-        "grant_type": "client_credentials"
-    }
-    response = requests.post(url, params=params)
-    return response.json().get("access_token")
-
-
-async def send_to_twitch(message: str):
-    """Send message to Twitch chat (requires bot account setup)"""
-    try:
-        # Note: This uses Twitch's IRC interface via a simple approach
-        # For production, use twitchio library with a bot account
-        # This is a placeholder showing the structure
-        
-        token = get_twitch_token()
-        # Twitch Chat API requires a bot account with chat:edit scope
-        # The client_credentials flow doesn't grant chat access
-        # You'll need to use OAuth with a user token instead
-        
-        print(f"[Twitch] Would send: {message}")
-        # TODO: Implement with proper bot OAuth token
-        return {"success": True, "platform": "twitch"}
-    except Exception as e:
-        print(f"[Twitch Error] {str(e)}")
-        return {"success": False, "error": str(e)}
-
-
-# ========== YOUTUBE INTEGRATION ==========
+# ========== YOUTUBE INTEGRATION (HYBRID) ==========
 
 def get_youtube_credentials():
     """Get or refresh YouTube OAuth credentials"""
     creds = None
     
-    # Check if we have saved credentials
     if os.path.exists('token.pickle'):
         with open('token.pickle', 'rb') as token:
             creds = pickle.load(token)
     
-    # If no valid credentials, do the OAuth flow
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
@@ -91,20 +74,49 @@ def get_youtube_credentials():
                 'client_secret.json', YOUTUBE_SCOPES)
             creds = flow.run_local_server(port=8080)
         
-        # Save credentials for next run
         with open('token.pickle', 'wb') as token:
             pickle.dump(creds, token)
     
     return creds
 
 
+async def youtube_listener():
+    """Background task: Listen to YouTube chat using pytchat (quota-free)"""
+    global youtube_chat_listener
+    
+    if not YOUTUBE_VIDEO_ID:
+        print("[YouTube Listener] No VIDEO_ID set. Skipping.")
+        return
+    
+    try:
+        print(f"[YouTube Listener] Starting for video: {YOUTUBE_VIDEO_ID}")
+        youtube_chat_listener = pytchat.create(video_id=YOUTUBE_VIDEO_ID)
+        
+        while youtube_chat_listener.is_alive():
+            for chat in youtube_chat_listener.get().sync_items():
+                # Save to Supabase
+                data = {
+                    "username": chat.author.name,
+                    "message_text": chat.message,
+                    "platform": "youtube",
+                    "is_subscriber": chat.author.isChatSponsor
+                }
+                supabase.table("chat_messages").insert(data).execute()
+                print(f"[YouTube] {chat.author.name}: {chat.message}")
+            
+            await asyncio.sleep(0.5)  # Small delay to prevent CPU spin
+            
+    except Exception as e:
+        print(f"[YouTube Listener Error] {str(e)}")
+
+
 async def send_to_youtube(message: str):
-    """Send message to YouTube Live Chat"""
+    """Send message to YouTube Live Chat using official API"""
     try:
         creds = get_youtube_credentials()
         youtube = build('youtube', 'v3', credentials=creds)
         
-        # Step 1: Get the active live broadcast
+        # Get active broadcast
         broadcasts = youtube.liveBroadcasts().list(
             part="snippet",
             broadcastStatus="active",
@@ -112,13 +124,12 @@ async def send_to_youtube(message: str):
         ).execute()
         
         if not broadcasts.get('items'):
-            print("[YouTube] No active broadcast found")
+            print("[YouTube Send] No active broadcast found")
             return {"success": False, "error": "No active stream"}
         
-        # Step 2: Get the live chat ID
         live_chat_id = broadcasts['items'][0]['snippet']['liveChatId']
         
-        # Step 3: Insert the message
+        # Insert message
         youtube.liveChatMessages().insert(
             part="snippet",
             body={
@@ -132,11 +143,80 @@ async def send_to_youtube(message: str):
             }
         ).execute()
         
-        print(f"[YouTube] Sent: {message}")
+        print(f"[YouTube Send] ✓ {message}")
         return {"success": True, "platform": "youtube"}
         
     except Exception as e:
-        print(f"[YouTube Error] {str(e)}")
+        print(f"[YouTube Send Error] {str(e)}")
+        return {"success": False, "error": str(e)}
+
+
+# ========== TWITCH INTEGRATION (WebSocket) ==========
+
+async def on_twitch_ready(ready_event: EventData):
+    """Called when Twitch chat is ready"""
+    print(f"[Twitch] Connected as {ready_event.chat.username}")
+    await ready_event.chat.join_room(TWITCH_CHANNEL_NAME)
+
+
+async def on_twitch_message(msg: ChatMessage):
+    """Called when a Twitch message arrives"""
+    # Save to Supabase
+    data = {
+        "username": msg.user.name,
+        "message_text": msg.text,
+        "platform": "twitch",
+        "is_subscriber": msg.user.subscriber
+    }
+    supabase.table("chat_messages").insert(data).execute()
+    print(f"[Twitch] {msg.user.name}: {msg.text}")
+
+
+async def twitch_listener():
+    """Background task: Listen to Twitch chat using WebSocket"""
+    global twitch_chat
+    
+    try:
+        print("[Twitch Listener] Starting...")
+        
+        # Authenticate
+        twitch = await Twitch(TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET)
+        auth = UserAuthenticator(twitch, [AuthScope.CHAT_READ, AuthScope.CHAT_EDIT])
+        token, refresh_token = await auth.authenticate()
+        await twitch.set_user_authentication(token, [AuthScope.CHAT_READ, AuthScope.CHAT_EDIT])
+        
+        # Create chat client
+        twitch_chat = await Chat(twitch)
+        
+        # Register event handlers
+        twitch_chat.register_event(ChatEvent.READY, on_twitch_ready)
+        twitch_chat.register_event(ChatEvent.MESSAGE, on_twitch_message)
+        
+        # Start listening
+        twitch_chat.start()
+        
+        # Keep alive
+        while True:
+            await asyncio.sleep(1)
+            
+    except Exception as e:
+        print(f"[Twitch Listener Error] {str(e)}")
+
+
+async def send_to_twitch(message: str):
+    """Send message to Twitch chat"""
+    global twitch_chat
+    
+    try:
+        if twitch_chat is None:
+            return {"success": False, "error": "Twitch chat not initialized"}
+        
+        await twitch_chat.send_message(TWITCH_CHANNEL_NAME, message)
+        print(f"[Twitch Send] ✓ {message}")
+        return {"success": True, "platform": "twitch"}
+        
+    except Exception as e:
+        print(f"[Twitch Send Error] {str(e)}")
         return {"success": False, "error": str(e)}
 
 
@@ -150,6 +230,16 @@ async def broadcast_to_platforms(message: str):
         return_exceptions=True
     )
     print(f"[Broadcast Results] {results}")
+
+
+# ========== STARTUP EVENT ==========
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background listeners when FastAPI starts"""
+    asyncio.create_task(youtube_listener())
+    asyncio.create_task(twitch_listener())
+    print("🚀 [StreamLine Brain] All listeners started!")
 
 
 # ========== API ENDPOINTS ==========
@@ -220,19 +310,12 @@ async def broadcast_message(req: BroadcastRequest, background_tasks: BackgroundT
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/test-youtube")
-async def test_youtube():
-    """Test endpoint to verify YouTube auth is working"""
-    try:
-        creds = get_youtube_credentials()
-        youtube = build('youtube', 'v3', credentials=creds)
-        
-        broadcasts = youtube.liveBroadcasts().list(
-            part="snippet",
-            broadcastStatus="active",
-            maxResults=1
-        ).execute()
-        
-        return {"status": "connected", "active_streams": len(broadcasts.get('items', []))}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+@app.get("/health")
+async def health_check():
+    """Check if listeners are running"""
+    return {
+        "youtube_listener": youtube_chat_listener is not None and youtube_chat_listener.is_alive() if youtube_chat_listener else False,
+        "twitch_listener": twitch_chat is not None,
+        "supabase": "connected",
+        "gemini": "connected"
+    }
